@@ -1,10 +1,9 @@
 /*
 File: process.go
-Version: 3.10.0
-Last Update: 2026-01-11
+Version: 3.11.0
+Last Update: 2026-01-12
 Description: Handles the core processing logic for DNS requests.
-             UPDATED: Applied Dynamic Rate Limiting at the start of request processing.
-             UPDATED: Applied LogClientName logic for rich logging.
+             UPDATED: Replaced AttemptCrossFetch with TrackAndPredict (Markov).
 */
 
 package main
@@ -48,7 +47,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	start := time.Now()
 	
 	// --- 0. DYNAMIC RATE LIMITING ---
-	// Checked before parsing detailed context to save resources on overload
 	remoteAddr := w.RemoteAddr()
 	clientIP := getIPFromAddr(remoteAddr)
 	
@@ -71,7 +69,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		}
 	}
 
-	// Capture the original QID from the client.
 	originalID := r.Id
 
 	reqCtx := reqCtxPool.Get().(*RequestContext)
@@ -105,7 +102,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		qInfo = buildQueryInfo(q)
 	}
 
-	// Only build log string if necessary
 	if IsInfoEnabled() {
 		sb.Reset()
 		qInfo = appendEDNSInfoToLog(&sb, reqCtx, qInfo, r)
@@ -114,7 +110,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 	if config.Server.DDR.Enabled && qType == dns.TypeSVCB && reqCtx.QueryName == "_dns.resolver.arpa" {
 		if resp := generateDDRResponse(r, reqCtx.ServerIP); resp != nil {
-			// Ensure response ID matches request ID
 			resp.Id = originalID
 			w.WriteMsg(resp)
 			if IsInfoEnabled() {
@@ -130,7 +125,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		q := r.Question[0]
 		routingKey := ruleName
 		
-		// OPTIMIZATION: Efficient cache key generation
 		sb.Reset()
 		sb.WriteString(reqCtx.QueryName)
 		sb.WriteString("|")
@@ -145,9 +139,11 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// --- CACHE CHECK (First) ---
 	if config.Cache.Enabled && cacheKey != "" {
 		if cachedResp, remainingTTL := getFromCacheWithTTL(cacheKey, originalID); cachedResp != nil {
-			// Hit! Serve immediately.
 			serveCache(w, cachedResp, remainingTTL, originalID, reqCtx, ruleName, qInfo, start)
-			return // Exit prevents any cross-fetching logic below
+			
+			// PREDICTIVE PREFETCH (On Cache Hit too, to keep sequence alive)
+			TrackAndPredict(reqCtx.ClientIP, reqCtx.QueryName, ruleName, selectedUpstreams, selectedStrategy, reqCtx)
+			return
 		}
 	}
 
@@ -170,7 +166,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		if found {
 			resp := new(dns.Msg)
 			resp.SetReply(r)
-			resp.Id = originalID // Ensure ID matches
+			resp.Id = originalID 
 
 			if config.Server.Response.CNAMEFlattening {
 				flattenCNAMEs(resp)
@@ -181,22 +177,18 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 
 			if len(answers) > 0 {
 				resp.Answer = answers
-
 				if config.Cache.Enabled && cacheKey != "" {
 					addToCache(cacheKey, resp)
 				}
-
 				w.WriteMsg(resp)
 				if IsInfoEnabled() {
 					logRequest(originalID, 0, reqCtx, ruleName, qInfo, "", "NOERROR (HOSTS)", "HOSTS", 0, time.Since(start), resp)
 				}
 			} else {
 				resp.Rcode = dns.RcodeNameError
-
 				if config.Cache.Enabled && cacheKey != "" {
 					addToCache(cacheKey, resp)
 				}
-
 				w.WriteMsg(resp)
 				if IsInfoEnabled() {
 					logRequest(originalID, 0, reqCtx, ruleName, qInfo, "", "NXDOMAIN (HOSTS)", "HOSTS", 0, time.Since(start), resp)
@@ -211,24 +203,12 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		checkName := dns.Fqdn(reqCtx.QueryName)
 		isNX, remainingTTL := CheckParentNXDomain(checkName, ruleName)
 		
-		if IsDebugEnabled() {
-			typeName := "UNKNOWN"
-			if t, ok := dns.TypeToString[qType]; ok {
-				typeName = t
-			} else {
-				typeName = strconv.Itoa(int(qType))
-			}
-			LogDebug("[PROCESS] HardenNX Check: %s (%s) (Rule: %s) -> Hit: %v", checkName, typeName, ruleName, isNX)
-		}
-
 		if isNX {
 			LogDebug("[PROCESS] HardenNX triggered for %s (Rule: %s)", checkName, ruleName)
-
 			resp := new(dns.Msg)
 			resp.SetReply(r)
-			resp.Id = originalID // Ensure ID matches
+			resp.Id = originalID
 			resp.Rcode = dns.RcodeNameError
-			
 			w.WriteMsg(resp)
 			if IsInfoEnabled() {
 				status := fmt.Sprintf("NXDOMAIN (HARDENED, TTL:%ds)", remainingTTL)
@@ -241,7 +221,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	// --- UPSTREAM FORWARDING ---
 
 	msg := r.Copy()
-	// IMPORTANT: Randomize the QID for the upstream query.
 	randomID := dns.Id()
 	msg.Id = randomID
 	
@@ -256,13 +235,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		logEDNSDebug(msg, originalID)
 	}
 
-	// --- Singleflight Optimization ---
-
 	safeReqCtx := reqCtx.Clone()
 
-	// Use cacheKey as the suppression key
 	ch := requestGroup.DoChan(cacheKey, func() (interface{}, error) {
-		// STANDARD UPSTREAM FORWARDING
 		upstreamTimeout := getTimeout()
 		if upstreamTimeout == 0 {
 			upstreamTimeout = 5 * time.Second
@@ -274,7 +249,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		if err != nil {
 			return nil, err
 		}
-		// Return the randomized ID used alongside the result
 		return queryResult{msg: resp, upstreamStr: upstreamStr, rtt: rtt, upstreamQID: randomID}, nil
 	})
 
@@ -306,10 +280,6 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	qr := result.Val.(queryResult)
 	resp := qr.msg
 	shared := result.Shared
-	// If shared, qr.upstreamQID might be from the other request that won the race.
-	// For logging purposes, we should ideally log the ID that *this* request would have used (randomID),
-	// or the one that actually went out. Since singleflight coalesces, only one went out.
-	// Let's use the one from the result.
 	actualUpstreamQID := qr.upstreamQID
 
 	if shared && resp != nil {
@@ -317,14 +287,11 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	}
 
 	if resp != nil {
-		// --- IP FILTERING ON UPSTREAM RESPONSE ---
 		if hostsCache != nil {
 			clientInfo := reqCtx.ClientIP.String()
 			if reqCtx.ClientMAC != nil {
 				clientInfo = fmt.Sprintf("%s (%s)", clientInfo, reqCtx.ClientMAC.String())
 			}
-			
-			// Filter IPs. If returns true, message was modified.
 			hostsCache.FilterResponse(resp, reqCtx.QueryName, ruleName, clientInfo)
 		}
 
@@ -340,31 +307,9 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 	if config.Cache.Enabled && resp != nil {
 		addToCache(cacheKey, resp)
 
-		if config.Cache.Prefetch.CrossFetch.Enabled && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0 {
-			mode := config.Cache.Prefetch.CrossFetch.Mode
-			shouldPrefetch := false
-
-			switch mode {
-			case "on_a":
-				shouldPrefetch = (qType == dns.TypeA)
-			case "on_aaaa":
-				shouldPrefetch = (qType == dns.TypeAAAA)
-			case "both":
-				shouldPrefetch = (qType == dns.TypeA || qType == dns.TypeAAAA)
-			}
-
-			if shouldPrefetch {
-				req := prefetchReq{
-					qName:      reqCtx.QueryName,
-					qType:      qType,
-					routingKey: ruleName,
-					upstreams:  selectedUpstreams,
-					strategy:   selectedStrategy,
-					clientIP:   reqCtx.ClientIP,
-					clientMAC:  reqCtx.ClientMAC,
-				}
-				AttemptCrossFetch(req)
-			}
+		// PREDICTIVE PREFETCH (On Cache Miss/Upstream success)
+		if resp.Rcode == dns.RcodeSuccess {
+			TrackAndPredict(reqCtx.ClientIP, reqCtx.QueryName, ruleName, selectedUpstreams, selectedStrategy, reqCtx)
 		}
 	}
 
@@ -373,9 +318,7 @@ func processDNSRequest(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, re
 		status = fmt.Sprintf("%s (COALESCED)", status)
 	}
 
-	// CRITICAL: Restore the original Client's ID before sending back.
 	resp.Id = originalID
-
 	w.WriteMsg(resp)
 
 	if IsInfoEnabled() {
@@ -405,21 +348,15 @@ func logRequest(clientQID, upstreamQID uint16, reqCtx *RequestContext, ruleName,
 		macStr = reqCtx.ClientMAC.String()
 	}
 
-	// IMPLEMENTED: LogClientName support (Resolve IP to Name)
 	clientIdentity := reqCtx.ClientIP.String()
 	if config.Logging.LogClientName {
-		// 1. Try internal hosts cache (Default Rule has the most global view usually)
 		var names []string
 		if defHosts := config.Routing.DefaultRule.parsedHosts; defHosts != nil {
 			names = defHosts.GetHostnames(reqCtx.ClientIP)
 		}
-		
 		if len(names) > 0 {
-			// Found in local hosts file/cache
 			clientIdentity = fmt.Sprintf("%s (%s)", clientIdentity, names[0])
 		} else {
-			// 2. Fallback to System Resolver (DNS)
-			// NOTE: This can be blocking, but since we are in the log handler which is usually async or post-response, it's acceptable.
 			if names, err := net.LookupAddr(reqCtx.ClientIP.String()); err == nil && len(names) > 0 {
 				clientIdentity = fmt.Sprintf("%s (%s)", clientIdentity, strings.TrimSuffix(names[0], "."))
 			}
@@ -449,7 +386,6 @@ func logRequest(clientQID, upstreamQID uint16, reqCtx *RequestContext, ruleName,
 			useInfo = upstreamQInfo
 		}
 		
-		// If randomized, mark with *
 		qidStr := fmt.Sprintf("%d", upstreamQID)
 		if upstreamQID != clientQID {
 			qidStr += "*"
@@ -490,8 +426,6 @@ func logRequest(clientQID, upstreamQID uint16, reqCtx *RequestContext, ruleName,
 		ansStr = "Empty"
 	}
 
-	// Response log uses Client QID again to close the loop
-	// Added Client:%s matching the QRY format
 	LogInfo("[RSP] QID:%d | Client:%s | Status:%s | TotalTime:%v | Query:%s | Answers:[%s]", clientQID, clientIdentity, status, duration, qInfo, ansStr)
 }
 

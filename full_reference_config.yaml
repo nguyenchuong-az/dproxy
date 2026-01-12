@@ -250,13 +250,17 @@ cache:
 
   # --- Prefetching & Stale Cache ---
   prefetch:
-    # Cross-Fetch: If a client asks for A, automatically fetch AAAA (or vice versa)
-    cross_fetch:
-      enabled: false
-      # Mode: "off", "on_a" (fetch others when A requested), "on_aaaa", "both"
-      mode: "off"
-      # Types to fetch in background
-      fetch_types: ["A", "AAAA", "HTTPS"]
+    # Predictive Prefetching (Markov Chains):
+    # Learns query patterns (e.g., if netflix.com -> nflxvideo.net) and 
+    # prefetches the next domain if the probability exceeds the threshold.
+    predictive:
+      enabled: true
+      # Probability threshold (0.0 - 1.0). If P(Next|Current) > Threshold, prefetch Next.
+      threshold: 0.8
+      # How many domain transitions to track in memory.
+      max_memory: 5000
+      # Max time between queries to consider them a sequential chain.
+      learning_window: "5s"
       max_concurrent: 10
       timeout: "3s"
 

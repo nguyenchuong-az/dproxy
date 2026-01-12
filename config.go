@@ -1,8 +1,8 @@
 /*
 File: config.go
-Version: 2.16.0
+Version: 3.0.0
 Description: Defines configuration structures and handles YAML parsing and validation.
-             UPDATED: Moved LogClientName to LoggingConfig and wired it up.
+             UPDATED: Replaced CrossFetch with Predictive Prefetching (Markov Chains).
 */
 
 package main
@@ -159,7 +159,7 @@ type CacheConfig struct {
 }
 
 type PrefetchConfig struct {
-	CrossFetch   CrossFetchConfig   `yaml:"cross_fetch"`
+	Predictive   PredictiveConfig   `yaml:"predictive"`    // REPLACED CrossFetch with Predictive
 	StaleRefresh StaleRefreshConfig `yaml:"stale_refresh"`
 	LoadShedding LoadSheddingConfig `yaml:"load_shedding"`
 }
@@ -170,15 +170,17 @@ type LoadSheddingConfig struct {
 	MaxQueueUsagePct int  `yaml:"max_queue_usage_pct"` // Drop prefetch if worker queue > X% full
 }
 
-type CrossFetchConfig struct {
-	Enabled       bool     `yaml:"enabled"`
-	Mode          string   `yaml:"mode"`
-	FetchTypes    []string `yaml:"fetch_types"`
-	MaxConcurrent int      `yaml:"max_concurrent"`
-	Timeout       string   `yaml:"timeout"`
+// PredictiveConfig configures the Markov Chain prefetcher
+type PredictiveConfig struct {
+	Enabled        bool    `yaml:"enabled"`
+	Threshold      float64 `yaml:"threshold"`       // Probability threshold (0.0 - 1.0) to trigger prefetch
+	MaxMemory      int     `yaml:"max_memory"`      // Max distinct domains to track in transition matrix
+	LearningWindow string  `yaml:"learning_window"` // Max time between queries to consider them sequential
+	MaxConcurrent  int     `yaml:"max_concurrent"`  // Max concurrent prefetch requests
+	Timeout        string  `yaml:"timeout"`         // Timeout for prefetch requests
 
-	parsedFetchTypes []uint16
-	parsedTimeout    time.Duration
+	parsedWindow  time.Duration
+	parsedTimeout time.Duration
 }
 
 type StaleRefreshConfig struct {
@@ -210,7 +212,7 @@ type DefaultRule struct {
 	HostsWildcard    bool `yaml:"hosts_wildcard"`
 	HostsOptimize    bool `yaml:"hosts_optimize"`
 	HostsOptimizeTLD bool `yaml:"hosts_optimize_tld"`
-	HostsResponses   bool `yaml:"hosts_responses"` // New: Enable response filtering
+	HostsResponses   bool `yaml:"hosts_responses"`
 
 	RefreshInterval string `yaml:"refresh_interval"`
 
@@ -234,7 +236,7 @@ type RoutingRule struct {
 	HostsWildcard    bool `yaml:"hosts_wildcard"`
 	HostsOptimize    bool `yaml:"hosts_optimize"`
 	HostsOptimizeTLD bool `yaml:"hosts_optimize_tld"`
-	HostsResponses   bool `yaml:"hosts_responses"` // New: Enable response filtering
+	HostsResponses   bool `yaml:"hosts_responses"`
 
 	RefreshInterval string `yaml:"refresh_interval"`
 
@@ -540,12 +542,10 @@ func LoadConfig(path string) error {
 		return fmt.Errorf("prefetch config: %w", err)
 	}
 
-	// Parse routing rules (Synchronous Validation Phase)
+	// Parse routing rules
 	LogInfo("--- Loading Routing Rules (Parsing Phase) ---")
 	for i := range cfg.Routing.RoutingRules {
 		rule := &cfg.Routing.RoutingRules[i]
-
-		// Merge singular compatibility fields
 		if len(rule.HostFilesSingular) > 0 {
 			rule.HostsFiles = append(rule.HostsFiles, rule.HostFilesSingular...)
 		}
@@ -585,8 +585,6 @@ func LoadConfig(path string) error {
 		if rule.Strategy == "" {
 			rule.Strategy = "failover"
 		}
-
-		// Detailed Rule Logging
 		LogInfo("--- Rule: %s ---", rule.Name)
 		logMatchConditions(&rule.Match)
 		LogInfo("   └─ Forward: Strategy=%s, Upstreams=%d", rule.Strategy, len(rule.parsedUpstreams))
@@ -608,7 +606,7 @@ func LoadConfig(path string) error {
 		cfg.Routing.DefaultRule.parsedRefresh = d
 	}
 
-	// Parse default rule (Synchronous Validation Phase)
+	// Parse default rule
 	if cfg.Routing.DefaultRule.Upstreams == nil {
 		return fmt.Errorf("default upstreams are required")
 	}
@@ -637,7 +635,6 @@ func LoadConfig(path string) error {
 	// --- Global Deduplicated Hosts Loading ---
 	LogInfo("--- Loading Hosts (Global Deduplication Phase) ---")
 
-	// 1. Collect all unique paths and URLs
 	uniquePaths := make([]string, 0)
 	uniqueUrls := make([]string, 0)
 	pathMap := make(map[string]bool)
@@ -665,14 +662,12 @@ func LoadConfig(path string) error {
 	// Collect from Default Rule
 	collect(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs)
 
-	// 2. Load all sources once (concurrently) with Disk Caching Support
+	// Load sources
 	cacheDir := cfg.Cache.HostsCacheDir
 	sourceCache := BatchLoadSources(uniquePaths, uniqueUrls, cacheDir)
 
-	// 3. Assemble per-rule caches from shared sources (parallel assembly)
-	var assemblyWg sync.WaitGroup
-
 	// Assemble Rules
+	var assemblyWg sync.WaitGroup
 	for i := range cfg.Routing.RoutingRules {
 		rule := &cfg.Routing.RoutingRules[i]
 		if len(rule.HostsFiles) > 0 || len(rule.HostsURLs) > 0 {
@@ -681,7 +676,6 @@ func LoadConfig(path string) error {
 				defer assemblyWg.Done()
 				hc := NewHostsCache()
 				hc.SetTTL(uint32(cfg.Cache.HostsTTL))
-				// Pass flags: optimizeTLD, filterResponses
 				names, ips := hc.LoadFromCache(r.HostsFiles, r.HostsURLs, sourceCache, r.HostsWildcard, r.HostsOptimize, r.HostsOptimizeTLD, r.HostsResponses)
 				r.parsedHosts = hc
 				LogInfo("[RULE] Loaded hosts for '%s' (Names: %d, IPs: %d)", r.Name, names, ips)
@@ -696,14 +690,12 @@ func LoadConfig(path string) error {
 			defer assemblyWg.Done()
 			hc := NewHostsCache()
 			hc.SetTTL(uint32(cfg.Cache.HostsTTL))
-			// Pass flags: optimizeTLD, filterResponses
 			names, ips := hc.LoadFromCache(cfg.Routing.DefaultRule.HostsFiles, cfg.Routing.DefaultRule.HostsURLs, sourceCache, cfg.Routing.DefaultRule.HostsWildcard, cfg.Routing.DefaultRule.HostsOptimize, cfg.Routing.DefaultRule.HostsOptimizeTLD, cfg.Routing.DefaultRule.HostsResponses)
 			cfg.Routing.DefaultRule.parsedHosts = hc
 			LogInfo("[RULE] Loaded hosts for 'DEFAULT' (Names: %d, IPs: %d)", names, ips)
 		}()
 	}
 
-	// Wait for assembly to finish
 	assemblyWg.Wait()
 
 	LogInfo("--- Rule: DEFAULT ---")
@@ -720,7 +712,6 @@ func LoadConfig(path string) error {
 	return nil
 }
 
-// logMatchConditions logs all configured match conditions for a rule
 func logMatchConditions(m *MatchConditions) {
 	if len(m.ClientIP) > 0 {
 		LogInfo("   ├─ Match OR: Client IP = %v", []string(m.ClientIP))
@@ -755,41 +746,34 @@ func logMatchConditions(m *MatchConditions) {
 }
 
 func parsePrefetchConfig(p *PrefetchConfig) error {
-	// Cross-fetch defaults
-	cf := &p.CrossFetch
-	if cf.Mode == "" {
-		cf.Mode = "off"
-	}
+	// Predictive Defaults
+	pc := &p.Predictive
+	if pc.Enabled {
+		if pc.Threshold <= 0 || pc.Threshold > 1.0 {
+			pc.Threshold = 0.50 // Default 50%
+		}
+		if pc.MaxMemory <= 0 {
+			pc.MaxMemory = 5000 // Default track 5000 source domains
+		}
+		if pc.LearningWindow == "" {
+			pc.LearningWindow = "5s"
+		}
+		if pc.MaxConcurrent <= 0 {
+			pc.MaxConcurrent = 10
+		}
+		if pc.Timeout == "" {
+			pc.Timeout = "3s"
+		}
 
-	validModes := map[string]bool{"off": true, "on_a": true, "on_aaaa": true, "both": true}
-	if !validModes[cf.Mode] {
-		return fmt.Errorf("invalid cross_fetch.mode: %s (must be: off, on_a, on_aaaa, both)", cf.Mode)
-	}
-
-	if len(cf.FetchTypes) == 0 {
-		cf.FetchTypes = []string{"A", "AAAA", "HTTPS"}
-	}
-
-	cf.parsedFetchTypes = parseFetchTypes(cf.FetchTypes)
-	if len(cf.parsedFetchTypes) == 0 && cf.Enabled {
-		return fmt.Errorf("cross_fetch.fetch_types: no valid DNS types specified")
-	}
-
-	if cf.MaxConcurrent <= 0 {
-		cf.MaxConcurrent = 10
-	}
-
-	if cf.Timeout == "" {
-		cf.Timeout = "3s"
-	}
-	d, err := time.ParseDuration(cf.Timeout)
-	if err != nil {
-		return fmt.Errorf("invalid cross_fetch.timeout: %w", err)
-	}
-	cf.parsedTimeout = d
-
-	if cf.Mode != "off" {
-		cf.Enabled = true
+		var err error
+		pc.parsedWindow, err = time.ParseDuration(pc.LearningWindow)
+		if err != nil {
+			return fmt.Errorf("invalid predictive.learning_window: %w", err)
+		}
+		pc.parsedTimeout, err = time.ParseDuration(pc.Timeout)
+		if err != nil {
+			return fmt.Errorf("invalid predictive.timeout: %w", err)
+		}
 	}
 
 	// Stale refresh defaults
@@ -812,7 +796,7 @@ func parsePrefetchConfig(p *PrefetchConfig) error {
 	if sr.CheckInterval == "" {
 		sr.CheckInterval = "30s"
 	}
-	d, err = time.ParseDuration(sr.CheckInterval)
+	d, err := time.ParseDuration(sr.CheckInterval)
 	if err != nil {
 		return fmt.Errorf("invalid stale_refresh.check_interval: %w", err)
 	}
@@ -828,10 +812,9 @@ func parsePrefetchConfig(p *PrefetchConfig) error {
 	}
 
 	LogInfo("=== Prefetch Configuration ===")
-	LogInfo("Cross-Fetch: Enabled=%v, Mode=%s", cf.Enabled, cf.Mode)
-	if cf.Enabled {
-		LogInfo("  FetchTypes: %v", cf.FetchTypes)
-		LogInfo("  MaxConcurrent: %d, Timeout: %v", cf.MaxConcurrent, cf.parsedTimeout)
+	LogInfo("Predictive Prefetch: Enabled=%v, Threshold=%.2f, Memory=%d", pc.Enabled, pc.Threshold, pc.MaxMemory)
+	if pc.Enabled {
+		LogInfo("  LearningWindow: %v, MaxConcurrent: %d", pc.parsedWindow, pc.MaxConcurrent)
 	}
 	LogInfo("Stale-Refresh: Enabled=%v", sr.Enabled)
 	if sr.Enabled {
